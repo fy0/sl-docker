@@ -1,0 +1,203 @@
+name: docker-publish
+
+run-name: "docker-publish ${{ github.repository }}:${{ inputs.tag != '' && inputs.tag || inputs.snowluma_tag }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      snowluma_tag:
+        description: 'SnowLuma release tag to bake in (e.g. v1.14.19)'
+        required: true
+        default: ""
+      tag:
+        description: 'Image tag (defaults to snowluma_tag)'
+        required: false
+        default: ""
+      platforms:
+        description: 'Docker target platforms'
+        required: true
+        default: "linux/amd64,linux/arm64"
+      push:
+        description: 'Push image after build'
+        required: true
+        type: boolean
+        default: true
+      also_latest:
+        description: 'Also move :latest onto the pushed manifest'
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  SNOWLUMA_REPO: SnowLuma/SnowLuma
+
+jobs:
+  resolve:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Resolve target platforms
+        id: matrix
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -eu
+          matrix='{"include":['
+          separator=''
+          case ",${PLATFORMS}," in
+            *",linux/amd64,"*)
+              matrix="${matrix}${separator}{\"arch\":\"amd64\",\"platform\":\"linux/amd64\",\"os\":\"ubuntu-22.04\"}"
+              separator=','
+              ;;
+          esac
+          case ",${PLATFORMS}," in
+            *",linux/arm64,"*)
+              matrix="${matrix}${separator}{\"arch\":\"arm64\",\"platform\":\"linux/arm64\",\"os\":\"ubuntu-22.04-arm\"}"
+              separator=','
+              ;;
+          esac
+          matrix="${matrix}]}"
+          if [ "${matrix}" = '{"include":[]}' ]; then
+            echo "No supported platforms selected." >&2
+            exit 1
+          fi
+          echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.resolve.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Fetch SnowLuma lite tarball
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SNOWLUMA_TAG: ${{ inputs.snowluma_tag }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          case "${ARCH}" in
+            amd64) asset_arch="linux-x64" ;;
+            arm64) asset_arch="linux-arm64" ;;
+            *) echo "Unsupported matrix arch: ${ARCH}" >&2; exit 1 ;;
+          esac
+          asset="SnowLuma-${SNOWLUMA_TAG}-${asset_arch}-lite.tar.gz"
+          echo "Fetching ${asset} from ${SNOWLUMA_REPO}@${SNOWLUMA_TAG}"
+          gh release download "${SNOWLUMA_TAG}" \
+            --repo "${SNOWLUMA_REPO}" \
+            --pattern "${asset}" \
+            --output SnowLuma.Framework.tar.gz \
+            --clobber
+          ls -lh SnowLuma.Framework.tar.gz
+
+      - name: Set up Docker buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        if: ${{ inputs.push }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image
+        env:
+          IMAGE: ${{ env.IMAGE }}
+          TAG: ${{ inputs.tag != '' && inputs.tag || inputs.snowluma_tag }}
+          PUSH: ${{ inputs.push }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -eu
+          if [ "${PUSH}" = "true" ]; then
+            docker buildx build \
+              --platform "${PLATFORM}" \
+              --tag "${IMAGE}" \
+              --file ./Dockerfile \
+              --output "type=image,push-by-digest=true,name-canonical=true,push=true" \
+              --metadata-file metadata.json \
+              .
+            digest="$(jq -r '."containerimage.digest"' metadata.json)"
+            if [ -z "${digest}" ] || [ "${digest}" = "null" ]; then
+              echo "Unable to resolve pushed image digest" >&2
+              cat metadata.json >&2
+              exit 1
+            fi
+            mkdir -p digests
+            touch "digests/${digest#sha256:}"
+          else
+            docker buildx build \
+              --platform "${PLATFORM}" \
+              --tag "${IMAGE}:${TAG}" \
+              --file ./Dockerfile \
+              --load \
+              .
+          fi
+
+      - name: Upload image digest
+        if: ${{ inputs.push }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: docker-digest-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    if: ${{ inputs.push }}
+    needs:
+      - resolve
+      - build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Set up Docker buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download image digests
+        uses: actions/download-artifact@v7
+        with:
+          pattern: docker-digest-*
+          path: digests
+          merge-multiple: true
+
+      - name: Create manifest
+        env:
+          IMAGE: ${{ env.IMAGE }}
+          TAG: ${{ inputs.tag != '' && inputs.tag || inputs.snowluma_tag }}
+          ALSO_LATEST: ${{ inputs.also_latest }}
+        run: |
+          set -euo pipefail
+          cd digests
+          shopt -s nullglob
+          digest_files=(*)
+          if [ "${#digest_files[@]}" -eq 0 ]; then
+            echo "No image digests were produced" >&2
+            exit 1
+          fi
+          refs=()
+          for digest in "${digest_files[@]}"; do
+            refs+=("${IMAGE}@sha256:${digest}")
+          done
+          tags=(--tag "${IMAGE}:${TAG}")
+          if [ "${ALSO_LATEST}" = "true" ] && [ "${TAG}" != "latest" ]; then
+            tags+=(--tag "${IMAGE}:latest")
+          fi
+          docker buildx imagetools create "${tags[@]}" "${refs[@]}"
+          docker buildx imagetools inspect "${IMAGE}:${TAG}"
